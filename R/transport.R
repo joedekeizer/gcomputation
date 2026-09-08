@@ -1,4 +1,4 @@
-transport <- function(object, newdata, estim_var, n.sim=500, seed=NULL) {
+transport <- function(object, newdata, estim_var, nboot = 100, n.sim=500, seed=NULL) {
   if (!inherits(object, c("gcbinary", "gctimes", "gccount", "gccontinuous" ))) {
     stop("object must be of class 'gcbinary', 'gctimes', 'gccontinuous' or 'gccount'")
   }
@@ -6,8 +6,8 @@ transport <- function(object, newdata, estim_var, n.sim=500, seed=NULL) {
   
   if("initial.data" %in% attributes(object)$names){stop("Cannot transport when multiple imputations has been used, try relaunch gcomputation without it.")}
   
-  if(!(estim_var %in% c("monte_carlo", "point_estimate", "m_estimation"))){
-    stop("estim_ var parameter needs to be one of: monte_carlo, point_estimate, m_estimation")
+  if(!(estim_var %in% c("monte_carlo", "point_estimate", "m_estimation", "bootstrap"))){
+    stop("estim_ var parameter needs to be one of: monte_carlo, point_estimate, m_estimation, bootstrap")
   }
   
   fit <- object$qmodel.fit
@@ -16,6 +16,18 @@ transport <- function(object, newdata, estim_var, n.sim=500, seed=NULL) {
   if(estim_var == "m_estimation"){
     if(!(model %in% c("all", "aic", "bic"))){
       stop("M-estimation is only defined for parametric regression models: model = all, aic, bic")
+    }
+  }
+  
+  if(estim_var == "monte_carlo"){
+    if(!(model %in% c("all", "aic", "bic"))){
+      stop("Monte Carlo simulation is only defined for parametric regression models: model = all, aic, bic")
+    }
+  }
+  
+  if(estim_var == "point_estimate"){
+    if(!((model %in% c("lasso", "ridge", "elasticnet", "")) || inherits(object, "gctimes"))){
+      stop("Point estimate is only defined for penalized models (lasso, ridge, elasticnet) and survival models.")
     }
   }
   
@@ -499,33 +511,136 @@ transport <- function(object, newdata, estim_var, n.sim=500, seed=NULL) {
     
   }
   
+  if(estim_var == "bootstrap"){
+    
+    if(inherits(object, "gctimes")){
+      stop("bootstrap for object gctimes not implemented.")
+    }
+    
+    if(model %in% c("aic", "bic")){
+      stop("bootstrap is not yet implemented for models selected using AIC or BIC.")
+    }
+    
+    form <- object$formula
+    data_form <- object$data %>%
+      dplyr::select(all.vars(form))  
+    
+    if (any(is.na(data_form))){
+      
+      initial_data_omit <- na.omit(data_form)
+      nmiss_origin <- nrow(data_form) - nrow(initial_data_omit)
+      
+      data_origin <- initial_data_omit
+      
+      warning("Rows containing NA values in the original dataset have been removed!")
+      
+    } else {
+      
+      data_origin <- data_form
+      nmiss_origin <- 0
+      
+    }
+    
+    if(model %in% c("lasso", "ridge", "elasticnet")){
+      
+      list_res <- replicate(nboot,
+                            penalized_transport_forboot(gc = object, 
+                                                        data_ini = data_origin,
+                                                        data_target = newdata,
+                                                        boot = T),
+                            simplify = F)
+      
+      res_boot <- dplyr::bind_rows(list_res)
+      
+      
+    }
+    
+    if(model == "all"){
+      
+      list_res <- replicate(nboot,
+                            parametric_transport_forboot(gc = object, 
+                                                         data_ini = data_origin,
+                                                         data_target = newdata,
+                                                         boot = T),
+                            simplify = F)
+      
+      res_boot <- dplyr::bind_rows(list_res)
+      
+      
+    }
+    
+    if(inherits(object, "gcbinary")){
+      
+      ratio <- res_boot[["tau1"]]/res_boot[["tau0"]]
+      OR <- (res_boot[["tau1"]]*(1 - res_boot[["tau0"]]))/(res_boot[["tau0"]]*(1 - res_boot[["tau1"]]))
+      
+      adj_results <- data.frame(p1 = res_boot[["tau1"]], 
+                                p0 = res_boot[["tau0"]], 
+                                delta = res_boot[["delta"]], 
+                                ratio = ratio,
+                                OR = OR)
+      
+    }
+    
+    if(inherits(object, "gccontinuous")){
+      
+      ratio <- res_boot[["tau1"]]/res_boot[["tau0"]]
+      
+      adj_results <- data.frame(m1 = res_boot[["tau1"]], 
+                                m0 = res_boot[["tau0"]], 
+                                delta = res_boot[["delta"]], 
+                                ratio = ratio)
+      
+      
+    }
+    
+    if(inherits(object, "gccount")){
+      
+      ratio <- res_boot[["tau1"]]/res_boot[["tau0"]]
+      
+      adj_results <- data.frame(c1 = res_boot[["tau1"]], 
+                                c0 = res_boot[["tau0"]], 
+                                delta = res_boot[["delta"]], 
+                                ratio = ratio)
+      
+    }
+    
+    
+    
+    res <- list(
+      qmodel.fit = object$qmodel.fit,
+      predictions = NA,
+      tuning.parameters = object$tuning.parameters,
+      data = object$data,
+      newdata = newdata,
+      formula = formula,
+      model = model,
+      cv = object$cv,
+      missing = nmiss,
+      missing_origin = nmiss_origin,
+      n.sim = NULL,
+      nboot = nboot,
+      group = group,
+      n = nrow(newdata) - nmiss,
+      nevent = NA,
+      adjusted.results = adj_results,
+      effect = "ATE",
+      call = match.call()
+    )
+    
+    class(res) <- class(object)
+    
+    return(res)
+    
+    
+  }
+  
   
 }
 
 create_mestim_obj <- function(gc, data_target){
   
   form <- gc$tuning.parameters
-  
-  # if("initial.data" %in% attributes(gc)){
-  #   
-  #   data_form <- gc$initial.data %>%
-  #     select(all.vars(form))
-  #   
-  #   if(any(is.na(data_form))){
-  #     
-  #     initial_data_omit <- na.omit(data_form)
-  #     nmiss_origin <- nrow(data_form) - nrow(initial_data_omit)
-  #     
-  #     data_origin <- initial_data_omit
-  #     
-  #     warning("M-estimation for transportability cannot be used with multiple imputations, rows containing NA values in the original dataset have been removed!")
-  #     
-  #   }else{
-  #     
-  #     nmiss_origin <- 0
-  #     
-  #   }
-  # }else{
   
   data_form <- gc$data %>%
     dplyr::select(all.vars(form))  
@@ -545,9 +660,6 @@ create_mestim_obj <- function(gc, data_target){
     nmiss_origin <- 0
     
   }
-  
-  
-  # }
   
   grp_var <- gc$group
   family <- gc$qmodel.fit$family$family
@@ -582,7 +694,8 @@ create_mestim_obj <- function(gc, data_target){
               grp_var = grp_var,
               formula = form,
               family = family,
-              root_start = root_start)
+              root_start = root_start,
+              qmodel_fit = gc$qmodel.fit)
   
   class(out) <- c(paste0("mestim_", family), "mestim_list")
   
@@ -629,7 +742,7 @@ Mestimation_process.mestim_gaussian <- function(mestim_list, ...){
   n_estimands    <- length(estimands)
   estimands_names <- names(estimands)
   
-  fun_mestimate <- function(data, m, n, formula, group_var, family){
+  fun_mestimate <- function(data, m, n, formula, model_terms, group_var, family){
     
     vars_f <- all.vars(formula)
     
@@ -652,9 +765,11 @@ Mestimation_process.mestim_gaussian <- function(mestim_list, ...){
     data0[ ,group_var] <- 0
     data1[ ,group_var] <- 1
     
-    mm <- model.matrix(object = delete.response(terms(formula)), data = data)
-    mm0 <- model.matrix(object = delete.response(terms(formula)), data = data0)
-    mm1 <- model.matrix(object = delete.response(terms(formula)), data = data1)
+    mm  <- model.matrix(model_terms, data = data)
+    mm0 <- model.matrix(model_terms, data = data0)
+    mm1 <- model.matrix(model_terms, data = data1)
+    
+    
     
     function(theta){
       
@@ -670,6 +785,8 @@ Mestimation_process.mestim_gaussian <- function(mestim_list, ...){
         ((m + n)/m)*(1-S)*link_fun(lp0) - theta[p+1],
         ((m + n)/m)*(1-S)*link_fun(lp1) - theta[p+2]
       )
+      
+      
       
       eq_estimands <- vapply(seq_len(n_estimands), function(i){
         estimands[[i]](theta[p+1], theta[p+2]) - theta[p+2+i]
@@ -688,7 +805,8 @@ Mestimation_process.mestim_gaussian <- function(mestim_list, ...){
     data   = mestim_list$data,
     outer_args = list(n = mestim_list$n, 
                       m = mestim_list$m, 
-                      formula = mestim_list$formula,
+                      formula = mestim_list$form,
+                      model_terms = delete.response(terms(mestim_list$qmodel_fit)), 
                       group_var = mestim_list$grp_var,
                       family = mestim_list$family),
     root_control = geex::setup_root_control(start = mestim_list$root_start))
@@ -708,8 +826,6 @@ Mestimation_process.mestim_gaussian <- function(mestim_list, ...){
   
   attr(out, "model.matrix") <- mm
   
-  # out <- round(out, 3)
-  
   return(out)
   
 }
@@ -717,3 +833,154 @@ Mestimation_process.mestim_gaussian <- function(mestim_list, ...){
 Mestimation_process <- function(mestim_list, ...){
   UseMethod("Mestimation_process")
 }
+
+penalized_transport_forboot <- function(gc, data_ini, data_target, boot = T){
+  
+  grp <- gc$group
+  form <- gc$formula
+  model <- gc$model
+  
+  if(isTRUE(boot)){
+    
+    data_train <- dplyr::slice_sample(.data = data_ini, 
+                                      n = nrow(data_ini), 
+                                      replace = T)
+    
+    data_test <- dplyr::slice_sample(.data = data_target, 
+                                     n = nrow(data_target), 
+                                     replace = T)
+  }else{
+    
+    data_train <- data_ini
+    data_test <- data_target
+    
+  }
+  
+  data_test0 <- data_test1 <- data_test
+  data_test0[,grp] <- 0
+  data_test1[,grp] <- 1
+  
+  mm <- model.matrix(object = form, data = data_train)
+  mm0 <- model.matrix(object = form, data = data_test0)
+  mm1 <- model.matrix(object = form, data = data_test1)
+  
+  if("(Intercept)" %in% colnames(mm)){
+    
+    mm <- mm[,-1]
+    mm0 <- mm0[,-1]
+    mm1 <- mm1[,-1]
+    
+    intercept_bool <- T
+    
+  }else{
+    
+    intercept_bool <- F
+    
+  }
+  
+  y <- data_train[,all.vars(form)[1]]
+  
+  if(model == "ridge"){
+    alpha <- 0
+  }else{
+    if(model == "lasso"){
+      alpha <- 1
+    }else{
+      alpha <- gc$tuning.parameters$alpha
+    }
+  }
+  
+  if(inherits(gc, "gcbinary")){
+    fam <- "binomial"
+  }else{
+    if(inherits(gc, "gccontinuous")){
+      fam <- "gaussian"
+    }else{
+      if(inherits(gc, "gccount")){
+        fam <- "poisson"
+      }
+    }
+  }
+  
+  penalty_fact <- rep(1, ncol(mm))
+  penalty_fact[which(colnames(mm) == grp)] <- 0 #to set no penalty on group variable
+  
+  res_glmnet <- glmnet::glmnet(x = mm, y = y,family = fam, 
+                               alpha = alpha, 
+                               lambda = gc$tunning.parameters$lambda,
+                               penalty.factor = penalty_fact, 
+                               intercept = intercept_bool)
+  
+  
+  res0 <- predict(res_glmnet, newx = mm0, type = "response")
+  res1 <- predict(res_glmnet, newx = mm1, type = "response")
+  
+  tau0 <- mean(res0)
+  tau1 <- mean(res1)
+  ate <- tau1-tau0
+  
+  out <- c("tau0" = tau0,
+           "tau1" = tau1,
+           "delta" = ate)
+  
+  return(out)
+}
+
+parametric_transport_forboot <- function(gc, data_ini, data_target, boot = T){
+  
+  grp <- gc$group
+  form <- gc$formula
+  model <- gc$model
+  
+  if(isTRUE(boot)){
+    
+    data_train <- dplyr::slice_sample(.data = data_ini, 
+                                      n = nrow(data_ini), 
+                                      replace = T)
+    
+    data_test <- dplyr::slice_sample(.data = data_target, 
+                                     n = nrow(data_target), 
+                                     replace = T)
+  }else{
+    
+    data_train <- data_ini
+    data_test <- data_target
+    
+  }
+  
+  data_test0 <- data_test1 <- data_test
+  data_test0[,grp] <- 0
+  data_test1[,grp] <- 1
+  
+  
+  if(inherits(gc, "gcbinary")){
+    fam <- "binomial"
+  }else{
+    if(inherits(gc, "gccontinuous")){
+      fam <- "gaussian"
+    }else{
+      if(inherits(gc, "gccount")){
+        fam <- "poisson"
+      }
+    }
+  }
+  
+  res_glm <- glm(formula = form,
+                 family = fam, 
+                 data = data_train)
+  
+  
+  res0 <- predict(res_glm, newdata = data_test0, type = "response")
+  res1 <- predict(res_glm, newdata = data_test1, type = "response")
+  
+  tau0 <- mean(res0)
+  tau1 <- mean(res1)
+  ate <- tau1-tau0
+  
+  out <- c("tau0" = tau0,
+           "tau1" = tau1,
+           "delta" = ate)
+  
+  return(out)
+}
+
